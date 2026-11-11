@@ -53,14 +53,39 @@ static int cmp(const void *a, const void *b) {
     return (x > y) - (x < y);
 }
 
+static void *lines[NCHA][K];
+static char *ev;
+
+// Median ns per hop over TRIALS chases of the K lines homed at CHA h, from the current CPU.
+static double measure(int h) {
+    double ns[TRIALS];
+    for (int t = 0; t < TRIALS; t++) {
+        // Random cyclic chain over the K lines (new permutation each trial).
+        int perm[K];
+        for (int i = 0; i < K; i++) perm[i] = i;
+        for (int i = K - 1; i > 0; i--) { int j = lrand48() % (i + 1); int x = perm[i]; perm[i] = perm[j]; perm[j] = x; }
+        for (int i = 0; i < K; i++) *(void **)lines[h][perm[i]] = lines[h][perm[(i + 1) % K]];
+        for (size_t o = 0; o < EVICT; o += 64) ((volatile char *)ev)[o];
+        _mm_mfence();
+        void *p = lines[h][perm[0]];
+        unsigned aux;
+        uint64_t s = __rdtscp(&aux);
+        for (int i = 0; i < K; i++) p = *(void *volatile *)p;
+        uint64_t e = __rdtscp(&aux);
+        if (p != lines[h][perm[0]]) { fprintf(stderr, "chain broken\n"); exit(1); }
+        ns[t] = (double)(e - s) / TSC_GHZ / K;
+    }
+    qsort(ns, TRIALS, sizeof ns[0], cmp);
+    return ns[TRIALS / 2];
+}
+
 int main(int argc, char **argv) {
     int c0 = atoi(argv[1]), c1 = atoi(argv[2]);
     int pm = open("/proc/self/pagemap", O_RDONLY);
     if (pm < 0) { perror("pagemap"); return 1; }
     char *buf[2] = {alloc_on(0, BUF), alloc_on(1, BUF)};
-    char *ev = alloc_on(0, EVICT);
+    ev = alloc_on(0, EVICT);
     // Pick K lines per CHA, verify node of every page.
-    static void *lines[NCHA][K];
     int cnt[NCHA] = {0};
     srand48(1);
     for (int n = 0; n < 2; n++) {
@@ -84,27 +109,12 @@ int main(int argc, char **argv) {
     printf("\n");
     for (int cpu = c0; cpu <= c1; cpu++) {
         pin(cpu);
+        // Discarded pass: the first CHA measured on a cold core reads several ns high.
+        // (A plain rdtsc spin here made SMT siblings 32-40 read 4-9 ns high instead.)
+        for (int h = 0; h < NCHA; h++) measure(h);
         printf("%d", cpu);
         for (int h = 0; h < NCHA; h++) {
-            double ns[TRIALS];
-            for (int t = 0; t < TRIALS; t++) {
-                // Random cyclic chain over the K lines (new permutation each trial).
-                int perm[K];
-                for (int i = 0; i < K; i++) perm[i] = i;
-                for (int i = K - 1; i > 0; i--) { int j = lrand48() % (i + 1); int x = perm[i]; perm[i] = perm[j]; perm[j] = x; }
-                for (int i = 0; i < K; i++) *(void **)lines[h][perm[i]] = lines[h][perm[(i + 1) % K]];
-                for (size_t o = 0; o < EVICT; o += 64) ((volatile char *)ev)[o];
-                _mm_mfence();
-                void *p = lines[h][perm[0]];
-                unsigned aux;
-                uint64_t s = __rdtscp(&aux);
-                for (int i = 0; i < K; i++) p = *(void *volatile *)p;
-                uint64_t e = __rdtscp(&aux);
-                if (p != lines[h][perm[0]]) { fprintf(stderr, "chain broken\n"); return 1; }
-                ns[t] = (double)(e - s) / TSC_GHZ / K;
-            }
-            qsort(ns, TRIALS, sizeof ns[0], cmp);
-            printf(" %.1f", ns[TRIALS / 2]);
+            printf(" %.1f", measure(h));
             fflush(stdout);
         }
         printf("\n");

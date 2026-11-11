@@ -1,3 +1,4 @@
 /chamap
 /lat
 *.txt
+!latmat.txt
